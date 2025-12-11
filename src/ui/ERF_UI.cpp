@@ -302,10 +302,11 @@ void __stdcall ERF_UI::DrawEditGauge() {
     };
 
     if (ImGui::BeginTable("##erf_spells", 3,
-                          ImGuiTableFlags_Resizable | ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-        ImGui::TableSetupColumn("EditorID", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Plugin", ImGuiTableColumnFlags_WidthFixed, 200.0f);
-        ImGui::TableSetupColumn("Magnitude", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+                          ImGuiMCP::ImGuiTableFlags_Resizable | ImGuiMCP::ImGuiTableFlags_Borders |
+                              ImGuiMCP::ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("EditorID", ImGuiMCP::ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Plugin", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
+        ImGui::TableSetupColumn("Magnitude", ImGuiMCP::ImGuiTableColumnFlags_WidthFixed, 200.0f);
         ImGui::TableHeadersRow();
 
         for (auto& r : rows) {
