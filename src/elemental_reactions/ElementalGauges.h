@@ -34,10 +34,7 @@ namespace ElementalGauges {
         std::size_t size() const { return values.size(); }
     };
 
-    std::uint8_t Get(RE::Actor* a, ERF_ElementHandle elem);
-    void Set(RE::Actor* a, ERF_ElementHandle elem, std::uint8_t value);
     void Add(RE::Actor* a, ERF_ElementHandle elem, int delta);
-    void Clear(RE::Actor* a);
     void RegisterStore();
     void ForEachDecayed(const std::function<void(RE::FormID, TotalsView)>& fn);
     std::optional<HudGaugeBundle> PickHudDecayed(RE::FormID id, double nowRt, float nowH);

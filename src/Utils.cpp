@@ -96,18 +96,18 @@ bool Utils::GetNodePosition(RE::ActorPtr a_actor, const char* a_nodeName, RE::Ni
 
 bool Utils::GetTorsoPos(RE::ActorPtr a_actor, RE::NiPoint3& point) {
     if (!a_actor) return false;
-    RE::TESRace* race = a_actor->GetRace();
+    RE::TESRace const* race = a_actor->GetRace();
     if (!race) return false;
-    RE::BGSBodyPartData* bodyPartData = race->bodyPartData;
+    RE::BGSBodyPartData const* bodyPartData = race->bodyPartData;
     if (!bodyPartData) return false;
-    RE::BGSBodyPart* bodyPart = bodyPartData->parts[0];
+    RE::BGSBodyPart const* bodyPart = bodyPartData->parts[0];
     if (!bodyPart) return false;
     return GetNodePosition(a_actor, bodyPart->targetName.c_str(), point);
 }
 
 bool Utils::GetBoundTopPos(RE::Actor* a, RE::NiPoint3& out) {
     if (!a) return false;
-    if (auto* root = a->Get3D(false)) {
+    if (auto const* root = a->Get3D(false)) {
         const auto& b = root->worldBound;
         const float r = (b.radius > 1e-4f) ? b.radius : kBoundFallbackRadius;
         out = {b.center.x, b.center.y, b.center.z + r};
@@ -125,8 +125,8 @@ bool Utils::GetTargetPos(RE::ObjectRefHandle a_target, RE::NiPoint3& pos, bool b
         RE::Actor* actorRaw = target->As<RE::Actor>();
         RE::ActorPtr actorPtr(actorRaw);
 
-        if (bPreferBody) {
-            if (GetTorsoPos(actorPtr, pos)) return true;
+        if (bPreferBody && GetTorsoPos(actorPtr, pos)) {
+            return true;
         }
         if (Utils::GetHeadPosFast(actorRaw, pos)) return true;
         if (Utils::GetBoundTopPos(actorRaw, pos)) return true;
