@@ -28,8 +28,6 @@ using Elem = ERF_ElementHandle;
 namespace Gauges {
     inline constexpr std::uint32_t kRecordID = FOURCC('G', 'A', 'U', 'V');
     inline constexpr std::uint32_t kVersion = 4;
-    inline constexpr float increaseMult = 1.30f;
-    inline constexpr float decreaseMult = 0.10f;
     constexpr bool kReserveZero = true;
 
     struct Entry {
@@ -68,7 +66,6 @@ namespace Gauges {
 
     inline std::size_t firstIndex() { return kReserveZero ? 1u : 0u; }
     inline std::size_t idx(ERF_ElementHandle h) { return static_cast<std::size_t>(h == 0 ? 1 : h); }
-    inline std::size_t idxElem(ERF_ElementHandle h) { return static_cast<std::size_t>(h == 0 ? 1 : h); }
     inline std::size_t idxReact(ERF_ReactionHandle r) { return static_cast<std::size_t>(r == 0 ? 1 : r); }
     inline std::size_t idxPre(ERF_PreEffectHandle p) { return static_cast<std::size_t>(p == 0 ? 1 : p); }
 
@@ -129,6 +126,7 @@ namespace Gauges {
         e.posInList[i] = static_cast<std::uint16_t>(e.presentList.size());
         e.presentList.push_back(h);
     }
+
     inline void dropPresent(Entry& e, std::size_t i) {
         if (i < firstIndex()) return;
         if (i >= e.posInList.size()) return;
@@ -147,6 +145,7 @@ namespace Gauges {
         e.presentList.pop_back();
         e.posInList[i] = 0xFFFF;
     }
+
     inline void onValChange(Entry& e, std::size_t i, int before, int after) {
         if (i < firstIndex()) return;
 
@@ -180,7 +179,8 @@ namespace Gauges {
             dropPresent(e, i);
     }
 
-    inline void tickOne(Entry& e, std::size_t i, float nowH, const DecaySnapshot& snap) {
+    template <class F>
+    inline void tickOne(Entry& e, std::size_t i, float nowH, const DecaySnapshot& snap, F&& onChanged) {
         auto& val = e.v[i];
         auto& eval = e.lastEvalH[i];
         const float hit = e.lastHitH[i];
@@ -207,21 +207,34 @@ namespace Gauges {
         const auto decI = static_cast<int>(decF);
         if (decI <= 0) return;
 
-        const auto before = static_cast<int>(val);
+        const int before = static_cast<int>(val);
         int next = before - decI;
         if (next < 0) next = 0;
-        val = static_cast<std::uint8_t>(next);
-        if (next != before) onValChange(e, i, before, next);
+
+        if (next < before) {  // <- aqui está o “new < old”
+            val = static_cast<std::uint8_t>(next);
+            onValChange(e, i, before, next);
+            onChanged(i, static_cast<std::uint8_t>(before), static_cast<std::uint8_t>(next));
+        }
 
         const float rem = decF - static_cast<float>(decI);
         eval = nowH - (rem / rate);
     }
 
-    inline void tickAll(Entry& e, float nowH, const DecaySnapshot& snap) {
+    inline void tickOne(Entry& e, std::size_t i, float nowH, const DecaySnapshot& snap) {
+        tickOne(e, i, nowH, snap, [](std::size_t, std::uint8_t, std::uint8_t) {});
+    }
+
+    template <class F>
+    inline void tickAll(Entry& e, float nowH, const DecaySnapshot& snap, F&& onChanged) {
         const auto n = e.v.size();
         for (std::size_t i = firstIndex(); i < n; ++i) {
-            tickOne(e, i, nowH, snap);
+            tickOne(e, i, nowH, snap, onChanged);
         }
+    }
+
+    inline void tickAll(Entry& e, float nowH, const DecaySnapshot& snap) {
+        tickAll(e, nowH, snap, [](std::size_t, std::uint8_t, std::uint8_t) {});
     }
 
     inline void rebuildPresence(Entry& e) {
@@ -263,12 +276,6 @@ namespace {
         return std::chrono::duration<double>(clock::now() - t0).count();
     }
 
-    inline int SumAll(const Gauges::Entry& e) {
-        int s = 0;
-        for (std::size_t i = Gauges::firstIndex(); i < e.v.size(); ++i) s += e.v[i];
-        return s;
-    }
-
     inline void ApplyElementLocksForReaction(Gauges::Entry& e, const std::vector<ERF_ElementHandle>& elems,
                                              float seconds) {
         if (seconds <= 0.f) return;
@@ -290,6 +297,112 @@ namespace {
 
         const double untilRt = NowRealSeconds() + static_cast<double>(cooldownSeconds);
         if (ri < e.reactCdRtS.size()) e.reactCdRtS[ri] = std::max(e.reactCdRtS[ri], untilRt);
+    }
+
+    bool MaybeTriggerPreEffectsFor(RE::Actor* a, Gauges::Entry& e, ERF_ElementHandle elem, std::uint8_t gaugeNow) {
+        if (!a || elem == 0) return false;
+
+        const auto list = PreEffectRegistry::get().listByElement(elem);
+        if (list.empty()) return false;
+
+        const double nowRt = NowRealSeconds();
+        const float nowH = NowHours();
+
+        bool any = false;
+
+        for (auto ph : list) {
+            const auto* pd = PreEffectRegistry::get().get(ph);
+            if (!pd || pd->element != elem) continue;
+
+            const std::size_t pi = Gauges::idxPre(ph);
+            if (pi >= e.preActive.size()) continue;
+
+            if (const bool above = (gaugeNow >= pd->minGauge); !above) {
+                if (e.preActive[pi]) {
+                    e.preActive[pi] = 0u;
+                    e.preIntensity[pi] = 0.f;
+                    e.preExpireRtS[pi] = 0.0;
+                    e.preExpireH[pi] = 0.f;
+
+                    if (pd->cb) {
+                        if (auto* tasks = SKSE::GetTaskInterface()) {
+                            RE::ActorHandle h = a->CreateRefHandle();
+                            auto cb = pd->cb;
+                            auto user = pd->user;
+                            const auto passElem = elem;
+                            tasks->AddTask([h, cb, user, passElem]() {
+                                if (auto actorPtr = h.get().get()) {
+                                    cb(actorPtr, passElem, 0, 0.0f, user);
+                                }
+                            });
+                        }
+                    }
+                    any = true;
+                }
+                continue;
+            }
+
+            float intensity = pd->baseIntensity + pd->scalePerPoint * static_cast<float>(gaugeNow - pd->minGauge);
+            if (intensity < pd->minIntensity) intensity = pd->minIntensity;
+            if (intensity > pd->maxIntensity) intensity = pd->maxIntensity;
+
+            bool needApply = false;
+
+            if (!e.preActive[pi]) {
+                needApply = true;
+            } else {
+                if (const float last = e.preIntensity[pi]; std::fabs(last - intensity) > 1e-3f) {
+                    needApply = true;
+                }
+
+                if (!needApply && pd->durationSeconds > 0.0f) {
+                    constexpr double marginRt = 0.20;
+                    constexpr float marginH = 0.20f / 3600.0f;
+                    if (pd->durationIsRealTime) {
+                        if (nowRt + marginRt >= e.preExpireRtS[pi]) needApply = true;
+                    } else {
+                        if (nowH + marginH >= e.preExpireH[pi]) needApply = true;
+                    }
+                }
+            }
+
+            if (!needApply) continue;
+
+            if (pd->cb) {
+                if (auto* tasks = SKSE::GetTaskInterface()) {
+                    RE::ActorHandle h = a->CreateRefHandle();
+                    auto cb = pd->cb;
+                    auto user = pd->user;
+                    const auto passElem = elem;
+                    const auto passGauge = gaugeNow;
+                    const auto passIntensity = intensity;
+                    tasks->AddTask([h, cb, user, passElem, passGauge, passIntensity]() {
+                        if (auto actorPtr = h.get().get()) {
+                            cb(actorPtr, passElem, passGauge, passIntensity, user);
+                        }
+                    });
+                } else {
+                    pd->cb(a, elem, gaugeNow, intensity, pd->user);
+                }
+            }
+
+            e.preActive[pi] = 1u;
+            e.preIntensity[pi] = intensity;
+
+            if (pd->durationSeconds > 0.0f) {
+                if (pd->durationIsRealTime) {
+                    const double untilRt = nowRt + static_cast<double>(pd->durationSeconds);
+                    e.preExpireRtS[pi] = std::max(e.preExpireRtS[pi], untilRt);
+                } else {
+                    const float untilH = nowH + static_cast<float>(pd->durationSeconds / 3600.0);
+                    e.preExpireH[pi] = std::max(e.preExpireH[pi], untilH);
+                }
+            }
+
+            any = true;
+        }
+
+        return any;
     }
 
     bool TriggerReaction(RE::Actor* a, Gauges::Entry& e, ERF_ElementHandle elem) {
@@ -371,6 +484,7 @@ namespace {
                     e.lastEvalH[i] = nowH;
 
                     onValChange(e, i, before, 0);
+                    (void)MaybeTriggerPreEffectsFor(a, e, h2, 0);
                     clearedAny = true;
                 }
 
@@ -411,6 +525,7 @@ namespace {
                         e.lastEvalH[i] = nowH;
 
                         onValChange(e, i, before, 0);
+                        (void)MaybeTriggerPreEffectsFor(a, e, h, 0);
                     }
 
                     clearedAll = true;
@@ -478,6 +593,7 @@ namespace {
             e.lastHitH[idx] = nowH;
             e.lastEvalH[idx] = nowH;
             Gauges::onValChange(e, idx, beforeVal, 0);
+            (void)MaybeTriggerPreEffectsFor(a, e, elem, 0);
             return true;
         }
 
@@ -500,6 +616,7 @@ namespace {
                 e.lastHitH[idx] = nowH;
                 e.lastEvalH[idx] = nowH;
                 Gauges::onValChange(e, idx, beforeVal, 0);
+                (void)MaybeTriggerPreEffectsFor(a, e, elem, 0);
                 clearedElem = true;
             }
 
@@ -530,115 +647,6 @@ namespace {
                     ERF_ReactionContext ctx{};
                     ctx.target = a;
                     r->cb(ctx, r->user);
-                }
-            }
-
-            any = true;
-        }
-
-        return any;
-    }
-
-    bool MaybeTriggerPreEffectsFor(RE::Actor* a, Gauges::Entry& e, ERF_ElementHandle elem, std::uint8_t gaugeNow) {
-        if (!a || elem == 0) return false;
-
-        const auto list = PreEffectRegistry::get().listByElement(elem);
-        if (list.empty()) return false;
-
-        const double nowRt = NowRealSeconds();
-        const float nowH = NowHours();
-
-        bool any = false;
-
-        for (auto ph : list) {
-            const auto* pd = PreEffectRegistry::get().get(ph);
-            if (!pd || pd->element != elem) continue;
-
-            const std::size_t pi = Gauges::idxPre(ph);
-            if (pi >= e.preActive.size()) continue;
-
-            if (const bool above = (gaugeNow >= pd->minGauge); !above) {
-                if (e.preActive[pi]) {
-                    e.preActive[pi] = 0u;
-                    e.preIntensity[pi] = 0.f;
-                    e.preExpireRtS[pi] = 0.0;
-                    e.preExpireH[pi] = 0.f;
-
-                    if (pd->cb) {
-                        if (auto* tasks = SKSE::GetTaskInterface()) {
-                            RE::ActorHandle h = a->CreateRefHandle();
-                            auto cb = pd->cb;
-                            auto user = pd->user;
-                            const auto passElem = elem;
-                            const auto passGauge = gaugeNow;
-                            tasks->AddTask([h, cb, user, passElem, passGauge]() {
-                                if (auto actorPtr = h.get().get()) {
-                                    cb(actorPtr, passElem, passGauge, 0.0f, user);
-                                }
-                            });
-                        } else {
-                            pd->cb(a, elem, gaugeNow, 0.0f, pd->user);
-                        }
-                    }
-                    any = true;
-                }
-                continue;
-            }
-
-            float intensity = pd->baseIntensity + pd->scalePerPoint * static_cast<float>(gaugeNow - pd->minGauge);
-            if (intensity < pd->minIntensity) intensity = pd->minIntensity;
-            if (intensity > pd->maxIntensity) intensity = pd->maxIntensity;
-
-            bool needApply = false;
-
-            if (!e.preActive[pi]) {
-                needApply = true;
-            } else {
-                if (const float last = e.preIntensity[pi]; std::fabs(last - intensity) > 1e-3f) {
-                    needApply = true;
-                }
-
-                if (!needApply && pd->durationSeconds > 0.0f) {
-                    constexpr double marginRt = 0.20;
-                    constexpr float marginH = 0.20f / 3600.0f;
-                    if (pd->durationIsRealTime) {
-                        if (nowRt + marginRt >= e.preExpireRtS[pi]) needApply = true;
-                    } else {
-                        if (nowH + marginH >= e.preExpireH[pi]) needApply = true;
-                    }
-                }
-            }
-
-            if (!needApply) continue;
-
-            if (pd->cb) {
-                if (auto* tasks = SKSE::GetTaskInterface()) {
-                    RE::ActorHandle h = a->CreateRefHandle();
-                    auto cb = pd->cb;
-                    auto user = pd->user;
-                    const auto passElem = elem;
-                    const auto passGauge = gaugeNow;
-                    const auto passIntensity = intensity;
-                    tasks->AddTask([h, cb, user, passElem, passGauge, passIntensity]() {
-                        if (auto actorPtr = h.get().get()) {
-                            cb(actorPtr, passElem, passGauge, passIntensity, user);
-                        }
-                    });
-                } else {
-                    pd->cb(a, elem, gaugeNow, intensity, pd->user);
-                }
-            }
-
-            e.preActive[pi] = 1u;
-            e.preIntensity[pi] = intensity;
-
-            if (pd->durationSeconds > 0.0f) {
-                if (pd->durationIsRealTime) {
-                    const double untilRt = nowRt + static_cast<double>(pd->durationSeconds);
-                    e.preExpireRtS[pi] = std::max(e.preExpireRtS[pi], untilRt);
-                } else {
-                    const float untilH = nowH + static_cast<float>(pd->durationSeconds / 3600.0);
-                    e.preExpireH[pi] = std::max(e.preExpireH[pi], untilH);
                 }
             }
 
@@ -889,52 +897,6 @@ void ElementalGauges::Add(RE::Actor* a, ERF_ElementHandle elem, int delta) {
     (void)MaybeTriggerPreEffectsFor(a, e, elem, static_cast<std::uint8_t>(afterI));
 }
 
-std::uint8_t ElementalGauges::Get(RE::Actor* a, ERF_ElementHandle elem) {
-    if (!a) return 0;
-    auto it = Gauges::state().find(a->GetFormID());
-    if (it == Gauges::state().end()) return 0;
-    auto& e = it->second;
-    if (!e.sized) Gauges::initEntryDenseIfNeeded(e);
-
-    const auto i = Gauges::idx(elem);
-    const auto snap = Gauges::SnapshotDecay();
-    Gauges::tickOne(e, i, NowHours(), snap);
-    return e.v[i];
-}
-
-void ElementalGauges::Set(RE::Actor* a, ERF_ElementHandle elem, std::uint8_t value) {
-    if (!a || elem == 0) return;
-
-    auto& M = Gauges::state();
-    auto [__it, __inserted] = M.try_emplace(a->GetFormID());
-    auto& e = __it->second;
-    if (__inserted) Gauges::initEntryDenseIfNeeded(e);
-
-    const std::size_t i = Gauges::idx(elem);
-    const float nowH = NowHours();
-
-    const auto snap = Gauges::SnapshotDecay();
-    Gauges::tickAll(e, nowH, snap);
-
-    const auto afterDecay = static_cast<int>(e.v[i]);
-
-    if (const auto afterSet = static_cast<int>(clamp100(value)); afterSet != afterDecay) {
-        e.v[i] = static_cast<std::uint8_t>(afterSet);
-        Gauges::onValChange(e, i, afterDecay, afterSet);
-    } else {
-        e.v[i] = static_cast<std::uint8_t>(afterDecay);
-    }
-
-    e.lastHitH[i] = nowH;
-    e.lastEvalH[i] = nowH;
-}
-
-void ElementalGauges::Clear(RE::Actor* a) {
-    if (!a) return;
-    auto& m = Gauges::state();
-    m.erase(a->GetFormID());
-}
-
 void ElementalGauges::ForEachDecayed(const std::function<void(RE::FormID, TotalsView)>& fn) {
     auto& m = Gauges::state();
     const float nowH = NowHours();
@@ -944,7 +906,16 @@ void ElementalGauges::ForEachDecayed(const std::function<void(RE::FormID, Totals
     for (auto it = m.begin(); it != m.end();) {
         auto& e = it->second;
 
-        Gauges::tickAll(e, nowH, snap);
+        RE::Actor* actor = nullptr;
+        if (auto* f = RE::TESForm::LookupByID(it->first)) {
+            actor = f->As<RE::Actor>();
+        }
+
+        Gauges::tickAll(e, nowH, snap, [&](std::size_t idx, std::uint8_t, std::uint8_t after) {
+            if (!actor) return;
+            const auto h = Gauges::handleFromIndex(idx);
+            (void)MaybeTriggerPreEffectsFor(actor, e, h, after);
+        });
 
         const std::size_t beginE = Gauges::firstIndex();
         const std::size_t nE = e.v.size();
