@@ -21,7 +21,6 @@ include(${COMMONLIB_SRC_DIR}/cmake/CommonLibSSE.cmake)
 
 add_commonlibsse_plugin(ElementalReactionsFramework
   SOURCES
-    src/PCH.cpp
     src/plugin.cpp
     src/Utils.cpp
     src/elemental_reactions/ElementalStates.cpp

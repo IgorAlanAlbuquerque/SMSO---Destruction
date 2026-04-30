@@ -350,6 +350,10 @@ namespace GaugesHook {
                     });
 
                     if (inc > 0) {
+                        spdlog::info(
+                            "[UpdateHook tick] mgef '{}' (FormID {:08X}) elem={} target={:08X} inc={} accPerSec={:.2f}",
+                            mgef->GetName() ? mgef->GetName() : "?", mgef->GetFormID(), elem, target->GetFormID(), inc,
+                            accPerSec);
                         totalInc += inc;
                         ElementalGauges::Add(target, elem, inc);
                     }

@@ -67,7 +67,7 @@ namespace Gauges {
     inline std::size_t firstIndex() { return kReserveZero ? 1u : 0u; }
     inline std::size_t idx(ERF_ElementHandle h) { return static_cast<std::size_t>(h == 0 ? 1 : h); }
     inline std::size_t idxReact(ERF_ReactionHandle r) { return static_cast<std::size_t>(r == 0 ? 1 : r); }
-    inline std::size_t idxPre(ERF_PreEffectHandle p) { return static_cast<std::size_t>(p == 0 ? 1 : p); }
+    inline std::size_t idxPre(ERF_PreEffectHandle p) { return static_cast<std::size_t>(p); }
 
     inline void initEntryDenseIfNeeded(Entry& e) {
         if (e.sized) return;
@@ -211,7 +211,7 @@ namespace Gauges {
         int next = before - decI;
         if (next < 0) next = 0;
 
-        if (next < before) {  // <- aqui está o “new < old”
+        if (next < before) {
             val = static_cast<std::uint8_t>(next);
             onValChange(e, i, before, next);
             onChanged(i, static_cast<std::uint8_t>(before), static_cast<std::uint8_t>(next));
@@ -302,8 +302,23 @@ namespace {
     bool MaybeTriggerPreEffectsFor(RE::Actor* a, Gauges::Entry& e, ERF_ElementHandle elem, std::uint8_t gaugeNow) {
         if (!a || elem == 0) return false;
 
+        DEBUG_LOG("[ElementalGauges] MaybeTriggerPreEffectsFor: actor {:08X} elem {} gauge {}", a->GetFormID(), elem,
+                  gaugeNow);
+
         const auto list = PreEffectRegistry::get().listByElement(elem);
-        if (list.empty()) return false;
+        if (list.empty()) {
+            DEBUG_LOG("[ElementalGauges] MaybeTriggerPreEffectsFor: listByElement({}) retornou vazio", elem);
+            return false;
+        }
+
+        const std::size_t need = static_cast<std::size_t>(PreEffectRegistry::get().size()) + 1;
+        if (e.preActive.size() < need) e.preActive.resize(need, 0u);
+        if (e.preIntensity.size() < need) e.preIntensity.resize(need, 0.0f);
+        if (e.preExpireRtS.size() < need) e.preExpireRtS.resize(need, 0.0);
+        if (e.preExpireH.size() < need) e.preExpireH.resize(need, 0.0f);
+
+        DEBUG_LOG("[ElementalGauges] MaybeTriggerPreEffectsFor: {} pre-effect(s) encontrado(s) para elem {}",
+                  list.size(), elem);
 
         const double nowRt = NowRealSeconds();
         const float nowH = NowHours();
@@ -311,14 +326,29 @@ namespace {
         bool any = false;
 
         for (auto ph : list) {
+            DEBUG_LOG("[ElementalGauges] MaybeTriggerPreEffectsFor: Inside for");
             const auto* pd = PreEffectRegistry::get().get(ph);
-            if (!pd || pd->element != elem) continue;
+            if (!pd || pd->element != elem) {
+                DEBUG_LOG("[ElementalGauges] skip ph {}: pd={} elem_match={}", ph, (void*)pd,
+                          pd ? (pd->element == elem) : false);
+                continue;
+            }
 
             const std::size_t pi = Gauges::idxPre(ph);
-            if (pi >= e.preActive.size()) continue;
+            if (pi >= e.preActive.size()) {
+                DEBUG_LOG("[ElementalGauges] skip ph {}: pi {} >= preActive.size() {}", ph, pi, e.preActive.size());
+                continue;
+            }
 
             if (const bool above = (gaugeNow >= pd->minGauge); !above) {
+                DEBUG_LOG(
+                    "[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} gauge {} < minGauge {} — abaixo do limiar", ph,
+                    gaugeNow, pd->minGauge);
                 if (e.preActive[pi]) {
+                    DEBUG_LOG(
+                        "[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} estava ativo, desativando e despachando "
+                        "gauge=0",
+                        ph);
                     e.preActive[pi] = 0u;
                     e.preIntensity[pi] = 0.f;
                     e.preExpireRtS[pi] = 0.0;
@@ -346,12 +376,22 @@ namespace {
             if (intensity < pd->minIntensity) intensity = pd->minIntensity;
             if (intensity > pd->maxIntensity) intensity = pd->maxIntensity;
 
+            DEBUG_LOG(
+                "[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} gauge {} >= minGauge {} intensity {:.3f} preActive "
+                "{}",
+                ph, gaugeNow, pd->minGauge, intensity, (int)e.preActive[pi]);
+
             bool needApply = false;
 
             if (!e.preActive[pi]) {
+                DEBUG_LOG("[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} needApply=true (primeira ativação)", ph);
                 needApply = true;
             } else {
                 if (const float last = e.preIntensity[pi]; std::fabs(last - intensity) > 1e-3f) {
+                    DEBUG_LOG(
+                        "[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} needApply=true (intensity mudou {:.3f} -> "
+                        "{:.3f})",
+                        ph, last, intensity);
                     needApply = true;
                 }
 
@@ -359,16 +399,35 @@ namespace {
                     constexpr double marginRt = 0.20;
                     constexpr float marginH = 0.20f / 3600.0f;
                     if (pd->durationIsRealTime) {
-                        if (nowRt + marginRt >= e.preExpireRtS[pi]) needApply = true;
+                        if (nowRt + marginRt >= e.preExpireRtS[pi]) {
+                            DEBUG_LOG(
+                                "[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} needApply=true (expiração próxima "
+                                "RT {:.2f} >= {:.2f})",
+                                ph, nowRt + marginRt, e.preExpireRtS[pi]);
+                            needApply = true;
+                        }
                     } else {
-                        if (nowH + marginH >= e.preExpireH[pi]) needApply = true;
+                        if (nowH + marginH >= e.preExpireH[pi]) {
+                            DEBUG_LOG(
+                                "[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} needApply=true (expiração próxima "
+                                "H)",
+                                ph);
+                            needApply = true;
+                        }
                     }
                 }
             }
 
-            if (!needApply) continue;
+            if (!needApply) {
+                DEBUG_LOG("[ElementalGauges] MaybeTriggerPreEffectsFor: ph {} needApply=false, pulando", ph);
+                continue;
+            }
 
             if (pd->cb) {
+                DEBUG_LOG(
+                    "[ElementalGauges] MaybeTriggerPreEffectsFor: despachando callback ph {} actor {:08X} gauge {} "
+                    "intensity {:.3f}",
+                    ph, a->GetFormID(), gaugeNow, intensity);
                 if (auto* tasks = SKSE::GetTaskInterface()) {
                     RE::ActorHandle h = a->CreateRefHandle();
                     auto cb = pd->cb;
@@ -876,6 +935,9 @@ void ElementalGauges::Add(RE::Actor* a, ERF_ElementHandle elem, int delta) {
     e.lastEvalH[i] = nowH;
     onValChange(e, i, before, afterI);
 
+    DEBUG_LOG("[ElementalGauges] Add: actor {:08X} elem {} gauge {} -> {} (delta={} scaled={:.1f} mult={:.2f})",
+              a->GetFormID(), elem, before, afterI, delta, static_cast<float>(scaled), mult);
+
     if (ERF::GetConfig().hudEnabled.load(std::memory_order_relaxed)) {
         HUD::StartHUDTick();
     }
@@ -884,17 +946,30 @@ void ElementalGauges::Add(RE::Actor* a, ERF_ElementHandle elem, int delta) {
     const ERF_ElementDesc* d = ER.get(elem);
     const bool isIsolatedInMixed = d && d->noMixInMixedMode;
 
+    bool reacted = false;
+
     if (const bool singleMode = ERF::GetConfig().isSingle.load(std::memory_order_relaxed);
         singleMode || isIsolatedInMixed) {
         if (before < 100 && afterI >= 100) {
+            DEBUG_LOG(
+                "[ElementalGauges] Add: gauge atingiu 100, disparando TriggerReaction (singleMode={} isolated={})",
+                singleMode, isIsolatedInMixed);
             TriggerReaction(a, e, elem);
+            reacted = true;
         }
     } else {
         if (sumBeforeMix < 100 && e.sumMix >= 100) {
+            DEBUG_LOG("[ElementalGauges] Add: sumMix atingiu 100, disparando TriggerReaction (mixed)");
             TriggerReaction(a, e, 0);
+            reacted = true;
         }
     }
-    (void)MaybeTriggerPreEffectsFor(a, e, elem, static_cast<std::uint8_t>(afterI));
+
+    if (!reacted) {
+        DEBUG_LOG("[ElementalGauges] Add: chamando MaybeTriggerPreEffectsFor actor {:08X} elem {} gauge {}",
+                  a->GetFormID(), elem, afterI);
+        (void)MaybeTriggerPreEffectsFor(a, e, elem, static_cast<std::uint8_t>(afterI));
+    }
 }
 
 void ElementalGauges::ForEachDecayed(const std::function<void(RE::FormID, TotalsView)>& fn) {
